@@ -24,7 +24,7 @@ type LogManager struct {
 	Ctx                    context.Context
 	FlushedLsn             int64
 	LastCheckPointLsn      int64
-	ActiveTransactionTable map[uint64]*TransactionTableEntry
+	ActiveTransactionTable map[uint64]*TransactionTableEntry	// 活跃事务表
 	FlushDuration          time.Duration
 }
 
@@ -58,18 +58,25 @@ func ReadLastCheckPoint(reader *os.File) (int64, error) {
 }
 
 func NewLogManager(ctx context.Context, bufferSize int, checkPointFileName string, WAL string, flushDuration time.Duration) (*LogManager, error) {
+
+	// 打开 CheckPoint 文件
 	checkPointWriter, err := os.OpenFile(checkPointFileName, os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		return nil, err
 	}
+
+	// 读取上个 CheckPoint 对应的 LSN
 	lastCheckPointLsn, err := ReadLastCheckPoint(checkPointWriter)
 	if err != nil {
 		return nil, err
 	}
+
+	// 打开 wal 文件
 	wal, err := os.OpenFile(WAL, os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		return nil, err
 	}
+
 	return &LogManager{
 		CheckPointWriter:       checkPointWriter,
 		WAL:                    wal,
@@ -87,25 +94,25 @@ const InvalidLsn int64 = -1
 
 // Todo: maybe we need a crc here.
 type LogRecord struct {
-	LSN           int64
-	PrevLsn       int64
-	UndoNextLsn   int64
-	TransactionId uint64
-	PageId        int32
-	TP            LogRecordType
-	ActionTP      ActionType
-	BeforeValue   []byte
-	AfterValue    []byte
-	Done          chan bool
-	Force         bool
+	LSN           int64				//
+	PrevLsn       int64				//
+	UndoNextLsn   int64				//
+	TransactionId uint64			// 事务 ID
+	PageId        int32				// 页 ID
+	TP            LogRecordType		// 日志类型
+	ActionTP      ActionType		// 操作类型
+	BeforeValue   []byte			// 旧值
+	AfterValue    []byte			// 新值
+	Done          chan bool			// 完成落盘的回调通知管道
+	Force         bool				// 是否强制落盘
 }
 
 type ActionType byte
 
 const (
-	DelAction ActionType = iota
-	SetAction
-	AddAction
+	DelAction ActionType = iota	// 删除
+	SetAction					// 设置
+	AddAction					// 添加
 )
 
 var ActionTypeNameMap = map[ActionType]string{
@@ -118,14 +125,14 @@ type LogRecordType byte
 
 const (
 	SetLogType LogRecordType = iota
-	CompensationLogType
-	TransBeginLogType
-	TransCommitLogType
-	TransEndLogType
-	TransAbortLogType
-	CheckPointBeginLogType
-	CheckPointEndLogType
-	DummyLogType
+	CompensationLogType			//
+	TransBeginLogType			// 事务开始
+	TransCommitLogType			// 事务提交
+	TransEndLogType				// 事务结束
+	TransAbortLogType			// 事务中止
+	CheckPointBeginLogType		// CheckPoint 开始
+	CheckPointEndLogType		// CheckPoint 结束
+	DummyLogType				// 缓存日志刷盘
 )
 
 var LogRecordTypeNameMap = map[LogRecordType]string{
@@ -140,19 +147,19 @@ var LogRecordTypeNameMap = map[LogRecordType]string{
 }
 
 type TransactionTableEntry struct {
-	TransactionId uint64
-	State         TransactionState
-	Lsn           int64
-	UndoNextLsn   int64
+	TransactionId uint64			// 事务 ID
+	State         TransactionState	// 事务状态
+	Lsn           int64				// LSN
+	UndoNextLsn   int64				//
 }
 
 type TransactionState byte
 
 const (
-	TransactionC TransactionState = iota
-	TransactionU
-	TransactionP
-	TransactionE
+	TransactionC TransactionState = iota	// 提交
+	TransactionU							// 未决的
+	TransactionP							// 准备
+	TransactionE							// 结束
 )
 
 var TransactionStateNameMap = map[TransactionState]string{
@@ -282,33 +289,50 @@ var LogFlushCapacity = 1024 * 16
 func (log *LogManager) FlushPeriodly() {
 	logManagerLog.InfoF("start flush log goroutine, lsn: %d", log.Lsn)
 	defer logManagerLog.InfoF("end flush log goroutine")
+
+	// 记录缓存，完成 flush 之后会通过 close(record.done) 通知上游。
+	var pendingLog []*LogRecord
+	// 数据缓存，用于缓存一批数据，批量写磁盘，减少 IO 。
 	limit := LogFlushCapacity
 	buf := make([]byte, LogFlushCapacity)
-	var pendingLog []*LogRecord
 	i := 0
-	var l *LogRecord
+
+	var record *LogRecord
 	flush := false
 	for {
-		l = nil
+		record = nil
+
 		select {
+		// 退出信号
 		case <-log.Ctx.Done():
 			return
-		case l = <-log.LogBuffer:
+		// 读管道
+		case record = <-log.LogBuffer:
+		// 定时
 		case <-time.After(log.FlushDuration):
 			flush = true
 		}
-		if l == nil && !flush {
+
+		// 收到空数据，退出
+		if record == nil && !flush {
 			return
 		}
+
+		// 定时 flush
 		if flush {
+			// flush
 			log.Write(buf[:i], i)
+			// 通知写入完成
 			log.NoticeDone(pendingLog)
+			// 重置变量
 			pendingLog = nil
 			i = 0
 			flush = false
 			continue
 		}
-		if l.Force && l.TP == DummyLogType {
+
+		// 如果日志指定强制落盘，且其类型为 DummyLog，则将缓存日志刷盘。
+		if record.Force && record.TP == DummyLogType {
 			// logManagerLog.InfoF("data len: %d", i)
 			log.Write(buf[:i], i)
 			log.NoticeDone(pendingLog)
@@ -316,7 +340,9 @@ func (log *LogManager) FlushPeriodly() {
 			i = 0
 			continue
 		}
-		data := l.Serialize()
+
+		data := record.Serialize()
+
 		// logManagerLog.InfoF("data len: %d", len(data))
 		if len(data) > (limit - i) {
 			log.Write(buf[:i], i)
@@ -324,25 +350,35 @@ func (log *LogManager) FlushPeriodly() {
 			pendingLog = nil
 			i = 0
 		}
+
+		// 大日志，直接落盘
 		if len(data) > limit {
 			// Flush directly.
 			log.Write(data, len(data))
-			log.NoticeDone([]*LogRecord{l})
+			log.NoticeDone([]*LogRecord{record})
 			continue
 		}
-		pendingLog = append(pendingLog, l)
+
+
+		// 缓存记录
+		pendingLog = append(pendingLog, record)
+		// 缓存数据
 		copy(buf[i:], data)
 		i += len(data)
-		if l.Force {
+
+		// 如果日志指定强制落盘，就直接 flush
+		if record.Force {
 			// Force writing to logs.
 			log.Write(buf[:i], i)
 			log.NoticeDone(pendingLog)
 			i = 0
 			pendingLog = nil
 		}
+
 	}
 }
 
+// NoticeDone 通知完成日志的刷盘
 func (log *LogManager) NoticeDone(logs []*LogRecord) {
 	for _, l := range logs {
 		logManagerLog.InfoF("write a log: %s", l)
@@ -350,48 +386,65 @@ func (log *LogManager) NoticeDone(logs []*LogRecord) {
 	}
 }
 
+// 将 data 写入到 wal 文件中，更新 lsn
 func (log *LogManager) Write(data []byte, len int) {
 	if len == 0 {
 		return
 	}
 	log.WALLock.Lock()
-	i := 0
-	for i < len {
+	// 循环写入 WAL 文件
+	for i := 0; i < len; {
 		size, err := log.WAL.Write(data[i:])
 		if err != nil {
 			panic(err)
 		}
 		i += size
 	}
-	err := log.WAL.Sync()
-	if err != nil {
+	// 执行 WAL 文件落盘
+	if err := log.WAL.Sync(); err != nil {
 		panic(err)
 	}
+	// 解锁
 	log.WALLock.Unlock()
+
+	// 更新 LSN
 	log.Lock.Lock()
 	log.FlushedLsn += int64(len)
 	log.Lock.Unlock()
 }
 
+
+// 是否是事务日志
 func IsTransLog(l *LogRecord) bool {
 	return l.TP != CheckPointBeginLogType && l.TP != CheckPointEndLogType && l.TP != DummyLogType
 }
 
 func (log *LogManager) Append(l *LogRecord) *LogRecord {
 	log.Lock.Lock()
+
+	// 设置 LSN
 	l.LSN = log.Lsn
+
+	// 更新 LSN
 	log.Lsn += int64(l.Len())
+
+	// 如果是事务日志，就更新事务状态
 	if IsTransLog(l) {
 		log.updateActiveTransactionTable(l)
 	}
+
 	log.Lock.Unlock()
 
+	// 写入 buffer ，异步落盘
 	l.Done = make(chan bool)
 	log.LogBuffer <- l
+
 	return l
 }
 
 // Todo: need to check further.
+//
+// 根据日志类型，判断事务状态
 func transActionStateFromLogRecord(l *LogRecord) TransactionState {
 	switch l.TP {
 	case TransBeginLogType:
@@ -405,15 +458,19 @@ func transActionStateFromLogRecord(l *LogRecord) TransactionState {
 	}
 }
 
+
+// CheckPoint 定时创建 checkpoint
 func (log *LogManager) CheckPoint(bufManager *BufferManager) {
 	logManagerLog.InfoF("start checkpoint goroutine")
 	defer logManagerLog.InfoF("end checkpoint goroutine")
 	for {
+
 		select {
 		case <-time.After(log.FlushDuration):
 		case <-log.Ctx.Done():
 			return
 		}
+
 		err := log.DoCheckPoint(bufManager)
 		if err != nil {
 			panic(err)
@@ -422,34 +479,54 @@ func (log *LogManager) CheckPoint(bufManager *BufferManager) {
 }
 
 func (log *LogManager) DoCheckPoint(bufManager *BufferManager) error {
+
+	// 创建 "begin_checkpoint" 日志
 	beginCheckPointRecord := &LogRecord{
 		TP: CheckPointBeginLogType,
 	}
+
+	// 写入 wal 文件
 	log.Append(beginCheckPointRecord)
+
+	// 复制活跃事务表
 	transTable := log.CloneTransactionTable()
+
+	// 复制脏页列表
 	dirtyTable := bufManager.DirtyPageRecordTable()
 
+	// 脏页数 4B + N 个脏页 12B
 	dirtyTableBytes := make([]byte, len(dirtyTable)*12+4)
-	binary.BigEndian.PutUint32(dirtyTableBytes, uint32(len(dirtyTable)))
-	for i, entry := range dirtyTable {
+	binary.BigEndian.PutUint32(dirtyTableBytes, uint32(len(dirtyTable))) // 脏页数 4B
+	for i, entry := range dirtyTable {	// N 个脏页，每个 12B
 		copy(dirtyTableBytes[4+i*12:], entry.Serialize())
 	}
 
+	// 事务数 4B + N 个事务 25B
 	transTableBytes := make([]byte, len(transTable)*25+4)
 	binary.BigEndian.PutUint32(transTableBytes, uint32(len(transTable)))
 	for i, entry := range transTable {
 		copy(transTableBytes[4+i*25:], entry.Serialize())
 	}
+
 	// check point finish log
+	//
+	// 创建 "end_checkpoint" 日志
 	finishCheckPointLogRecord := &LogRecord{
 		TP:          CheckPointEndLogType,
 		BeforeValue: transTableBytes,
 		AfterValue:  dirtyTableBytes,
 		Force:       true,
 	}
+
+	// 写入 wal 文件
 	log.Append(finishCheckPointLogRecord)
+
+	// 等待完成落盘
 	log.WaitFlush(finishCheckPointLogRecord)
+
 	logManagerLog.InfoF("do a checkpoint: ")
+
+	///
 	return log.WriteBeginCheckPoint(beginCheckPointRecord.LSN)
 }
 
@@ -473,12 +550,14 @@ func (log *LogManager) WriteBeginCheckPoint(checkPointLsn int64) error {
 func (log *LogManager) CloneTransactionTable() (ret []TransactionTableEntry) {
 	log.Lock.Lock()
 	defer log.Lock.Unlock()
+
+	// 遍历活跃事务表
 	for txnId, v := range log.ActiveTransactionTable {
 		ret = append(ret, TransactionTableEntry{
-			TransactionId: txnId,
-			State:         v.State,
-			Lsn:           v.Lsn,
-			UndoNextLsn:   v.UndoNextLsn,
+			TransactionId: txnId,			// 事务 ID
+			State:         v.State,			// 事务状态
+			Lsn:           v.Lsn,			//
+			UndoNextLsn:   v.UndoNextLsn,	//
 		})
 	}
 	return ret
@@ -528,7 +607,10 @@ func (log *LogManager) AppendRecoveryLog(l *LogRecord) {
 }
 
 func (log *LogManager) updateActiveTransactionTable(l *LogRecord) {
+	// 查询事务
 	old, ok := log.ActiveTransactionTable[l.TransactionId]
+
+	// 如果不存在，则创建
 	if !ok {
 		old = &TransactionTableEntry{
 			TransactionId: l.TransactionId,
@@ -537,11 +619,14 @@ func (log *LogManager) updateActiveTransactionTable(l *LogRecord) {
 			UndoNextLsn:   l.LSN,
 		}
 		log.ActiveTransactionTable[l.TransactionId] = old
+	// 如果存在，就更新事务状态
 	} else {
 		old.State = transActionStateFromLogRecord(l)
 		old.Lsn, old.UndoNextLsn = l.LSN, l.LSN
 	}
 	logManagerLog.InfoF("update trans state: id: %d, now: %s", old.TransactionId, TransactionStateNameMap[old.State])
+
+	// 如果事务状态为 Committed 或者 End ，就从活跃事务表中移除
 	if old.State == TransactionC || old.State == TransactionE {
 		delete(log.ActiveTransactionTable, old.TransactionId)
 	}
@@ -555,6 +640,8 @@ func (log *LogManager) LogIterator(lsn int64) *LogIterator {
 	}
 }
 
+
+// ReadLog 从 wal 文件的 offset 偏移处读取一个 LogRecord 。
 func (log *LogManager) ReadLog(offset int64) (*LogRecord, error) {
 	l, err := ReadLog(log.WAL, offset)
 	if err != nil {
@@ -570,10 +657,14 @@ type LogIterator struct {
 }
 
 func ReadLog(wal *os.File, offset int64) (*LogRecord, error) {
+
+	// 定位到 Start 偏移处
 	_, err := wal.Seek(offset, io.SeekStart)
 	if err != nil {
 		return nil, err
 	}
+
+	// 读取 4B 的长度
 	bytes := make([]byte, 4)
 	for i := 0; i < 4; {
 		size, err := wal.Read(bytes[i:])
@@ -582,7 +673,11 @@ func ReadLog(wal *os.File, offset int64) (*LogRecord, error) {
 		}
 		i += size
 	}
+
+	// 解析出 data 的长度
 	len := binary.BigEndian.Uint32(bytes) - 4
+
+	// 读取 data
 	data := make([]byte, len)
 	for i := 0; i < int(len); {
 		size, err := wal.Read(data[i:])
@@ -595,6 +690,8 @@ func ReadLog(wal *os.File, offset int64) (*LogRecord, error) {
 		}
 		i += size
 	}
+
+	// 反序列化得到 LogRecord 并返回
 	data = append(bytes, data...)
 	ret := &LogRecord{}
 	err = ret.Deserialize(data)
@@ -626,6 +723,7 @@ type Pair struct {
 	Value []byte
 }
 
+// Serialize: len(key) + key + len(value) + value
 func (pair *Pair) Serialize() []byte {
 	data := make([]byte, pair.Len())
 	binary.BigEndian.PutUint32(data, uint32(len(pair.Key)))

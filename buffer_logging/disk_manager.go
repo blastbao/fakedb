@@ -21,21 +21,33 @@ func NewDiskManager(dataFile string) (*DiskManager, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DiskManager{Writer: writer}, nil
+	return &DiskManager{
+		Writer: writer,
+	}, nil
 }
 
+// 写入第 index 个页
 func (disk *DiskManager) Write(index int32, page *Page) error {
+	// 串行写
 	disk.Lock.Lock()
 	defer disk.Lock.Unlock()
+
+	// 定位偏移
 	_, err := disk.Writer.Seek(int64(index*PageSize), 0)
 	if err != nil {
 		return err
 	}
+
+	// 序列化
 	data := page.Serialize()
+
+	// 填充页
 	if len(data) < PageSize {
 		padding := make([]byte, PageSize-len(data))
 		data = append(data, padding...)
 	}
+
+	// 写数据
 	for i := uint32(0); i < page.Len(); {
 		size, err := disk.Writer.Write(data[i:])
 		if err != nil {
@@ -43,9 +55,11 @@ func (disk *DiskManager) Write(index int32, page *Page) error {
 		}
 		i += uint32(size)
 	}
+
 	return nil
 }
 
+// 读取第 index 个页
 func (disk *DiskManager) Read(index int32) (page *Page, err error) {
 	disk.Lock.Lock()
 	defer disk.Lock.Unlock()

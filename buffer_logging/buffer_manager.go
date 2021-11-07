@@ -37,12 +37,14 @@ func NewBufferManager(ctx context.Context, dataFile string, flushDuration time.D
 	}, nil
 }
 
+
+// Page 页
 type Page struct {
-	Dirty   bool
-	Key     []byte
-	Value   []byte
-	LSN     int64
-	RecvLsn int64 // recovery lsn. won't save to Disk.
+	Dirty   bool	// 是否脏页
+	Key     []byte	//
+	Value   []byte	//
+	LSN     int64	//
+	RecvLsn int64 	// recovery lsn. won't save to Disk.
 }
 
 // +----------+------------+
@@ -108,20 +110,32 @@ func (buffer *BufferManager) Get(id int32, key []byte) (bool, []byte, error) {
 func (buffer *BufferManager) Set(id int32, key, value []byte, lsn int64) error {
 	buffer.Lock.Lock()
 	defer buffer.Lock.Unlock()
+
+	// 取 Page ，不存在则创建
 	page, ok := buffer.Data[id]
 	if !ok {
-		page = &Page{Key: key, Value: value, Dirty: true, LSN: lsn, RecvLsn: lsn}
+		page = &Page{
+			Key: key,
+			Value: value,
+			Dirty: true,
+			LSN: lsn,
+			RecvLsn: lsn,
+		}
 		buffer.Data[id] = page
 		buffer.DirtyPageTable[id] = page
 		return nil
 	}
+
+
 	if page.RecvLsn == InvalidLsn {
 		page.RecvLsn = lsn
 	}
+
 	page.LSN = lsn
 	page.Key = key
 	page.Value = value
 	buffer.DirtyPageTable[id] = page
+
 	return nil
 }
 
@@ -155,18 +169,28 @@ func (buffer *BufferManager) Del(id int32, lsn int64) (err error) {
 func (buffer *BufferManager) GetPage(id int32) (*Page, error) {
 	buffer.Lock.Lock()
 	defer buffer.Lock.Unlock()
+
+	// 查询缓存
 	page, ok := buffer.Data[id]
 	if ok {
 		return page, nil
 	}
+
+	// 查询磁盘
 	page, err := buffer.Disk.Read(id)
 	if err != nil {
 		return nil, err
 	}
+
+	// 不存在，直接返回
 	if page == nil {
 		return nil, nil
 	}
+
+	// 保存到缓存
 	buffer.Data[id] = page
+
+	// 更新页面 Lsn
 	page.RecvLsn = InvalidLsn
 	return page, nil
 }
@@ -195,11 +219,13 @@ func (buffer *BufferManager) FlushDirtyPagesRegularly(logManager *LogManager) {
 	bufManagerLog.InfoF("start flush dirty page goroutine")
 	defer bufManagerLog.InfoF("end flush dirty page goroutine")
 	for {
+
 		select {
 		case <-time.After(buffer.FlushDuration):
 		case <-buffer.Ctx.Done():
 			return
 		}
+
 		buffer.Lock.Lock()
 		for id, page := range buffer.DirtyPageTable {
 			if page.LSN <= logManager.GetFlushedLsn() {
@@ -215,9 +241,11 @@ func (buffer *BufferManager) FlushDirtyPagesRegularly(logManager *LogManager) {
 	}
 }
 
+
+
 type DirtyPageRecord struct {
-	PageId int32
-	RevLSN int64
+	PageId int32	// 页面 ID
+	RevLSN int64	//
 }
 
 func (record *DirtyPageRecord) Serialize() []byte {
@@ -248,6 +276,8 @@ func (buffer *BufferManager) DirtyPageRecordTable() []*DirtyPageRecord {
 	buffer.Lock.Lock()
 	defer buffer.Lock.Unlock()
 	var ret []*DirtyPageRecord
+
+	// 遍历脏页列表
 	for id, page := range buffer.DirtyPageTable {
 		if page.Dirty {
 			ret = append(ret, &DirtyPageRecord{PageId: id, RevLSN: page.RecvLsn})
@@ -258,15 +288,21 @@ func (buffer *BufferManager) DirtyPageRecordTable() []*DirtyPageRecord {
 
 func (buffer *BufferManager) FlushDirtyPage(logManager *LogManager) {
 	buffer.Lock.Lock()
+
+	// 遍历脏页列表
 	for id, page := range buffer.DirtyPageTable {
+		//
 		if page.LSN <= logManager.GetFlushedLsn() {
 			bufManagerLog.InfoF("write dirty page: lsn: %d, key: %s, value: %s", page.LSN, string(page.Key), string(page.Value))
+			// 将 page 页刷盘
 			err := buffer.Disk.Write(id, page)
 			if err != nil {
 				panic(err)
 			}
+			// 移除脏页
 			delete(buffer.DirtyPageTable, id)
 		}
 	}
+
 	buffer.Lock.Unlock()
 }

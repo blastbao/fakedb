@@ -8,25 +8,33 @@ import (
 var recoveryLog = util.GetLog("recovery")
 
 func Recovery(logManager *LogManager, bufManager *BufferManager) (nextUsefulTransactionId uint64) {
+
+
 	activeTransActionTable, dirtyPageRecordsTable := analysisForRecovery(logManager)
 	go bufManager.FlushDirtyPagesRegularly(logManager)
+
 	// We use the maximum transactionId from the current trans table as the next transId.
 	nextUsefulTransactionId = NextUsefulTransId(activeTransActionTable)
+
+
 	err := redoForRecovery(logManager, bufManager, dirtyPageRecordsTable)
 	if err != nil {
 		panic(err)
 	}
+
 	err = undoForRecovery(logManager, bufManager, activeTransActionTable)
 	if err != nil {
 		panic(err)
 	}
+
 	cleanFinishTrans(logManager, activeTransActionTable)
-	err = logManager.WAL.Sync()
+
+	err = logManager.WAL.Sync()	// Wal 刷盘
 	if err != nil {
 		panic(err)
 	}
-	go logManager.FlushPeriodly()
-	go logManager.CheckPoint(bufManager)
+	go logManager.FlushPeriodly()			// 异步日志落盘
+	go logManager.CheckPoint(bufManager) 	// 定时创建 checkpoint
 	return
 }
 
@@ -41,7 +49,9 @@ func NextUsefulTransId(activeTransActionTable map[uint64]*TransactionTableEntry)
 }
 
 func cleanFinishTrans(logManager *LogManager, activeTransActionTable map[uint64]*TransactionTableEntry) {
+
 	for txnId, txn := range activeTransActionTable {
+
 		if txn.State == TransactionC || txn.State == TransactionP {
 			log := &LogRecord{
 				PrevLsn:       txn.Lsn,
@@ -51,9 +61,11 @@ func cleanFinishTrans(logManager *LogManager, activeTransActionTable map[uint64]
 			logManager.AppendRecoveryLog(log)
 			delete(activeTransActionTable, txnId)
 		}
+
 		if txn.State == TransactionE {
 			delete(activeTransActionTable, txnId)
 		}
+
 		if txn.State == TransactionU && txn.UndoNextLsn == InvalidLsn {
 			log := &LogRecord{
 				PrevLsn:       txn.Lsn,
@@ -63,6 +75,7 @@ func cleanFinishTrans(logManager *LogManager, activeTransActionTable map[uint64]
 			logManager.AppendRecoveryLog(log)
 			delete(activeTransActionTable, txnId)
 		}
+
 	}
 }
 
@@ -96,6 +109,7 @@ func handleCheckPointLogDuringRecovery(checkPointEndLog *LogRecord, activeTransA
 	dirtyPageTables map[int32]*DirtyPageRecord) {
 	transTable := DeserializeTransactionTableEntry(checkPointEndLog.BeforeValue)
 	dirtyTable := DeserializeDirtyPageRecord(checkPointEndLog.AfterValue)
+
 	for _, entry := range transTable {
 		_, ok := activeTransActionTable[entry.TransactionId]
 		if ok {
@@ -108,6 +122,7 @@ func handleCheckPointLogDuringRecovery(checkPointEndLog *LogRecord, activeTransA
 			UndoNextLsn:   entry.UndoNextLsn,
 		}
 	}
+
 	for _, entry := range dirtyTable {
 		_, ok := dirtyPageTables[entry.PageId]
 		if !ok {
@@ -244,14 +259,20 @@ func redoLog(bufManager *BufferManager, log *LogRecord) error {
 
 func undoForRecovery(logManager *LogManager, bufManager *BufferManager, activeTransactionTable map[uint64]*TransactionTableEntry) error {
 	for {
+
+		//
 		maxUndoLsn := maximumUndoLsn(activeTransactionTable)
 		if maxUndoLsn == InvalidLsn {
 			return nil
 		}
+
+		// 从 wal 文件的 offset 偏移处读取一个 LogRecord 。
 		log, err := logManager.ReadLog(maxUndoLsn)
 		if err != nil {
 			return err
 		}
+
+		// 不同 log 类型，做不同处理。
 		switch log.TP {
 		case TransAbortLogType, TransBeginLogType:
 			activeTransactionTable[log.TransactionId].UndoNextLsn = log.PrevLsn
