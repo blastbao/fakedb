@@ -2,21 +2,22 @@ package buffer_logging
 
 import (
 	"encoding/binary"
-	"github.com/xiaobogaga/fakedb/util"
+	"github.com/blastbao/fakedb/util"
 )
 
 var recoveryLog = util.GetLog("recovery")
 
 func Recovery(logManager *LogManager, bufManager *BufferManager) (nextUsefulTransactionId uint64) {
-
-
 	activeTransActionTable, dirtyPageRecordsTable := analysisForRecovery(logManager)
+
+	// 定时将脏页刷盘
 	go bufManager.FlushDirtyPagesRegularly(logManager)
 
 	// We use the maximum transactionId from the current trans table as the next transId.
+	// 获取下一个可用的事务 ID
 	nextUsefulTransactionId = NextUsefulTransId(activeTransActionTable)
 
-
+	//
 	err := redoForRecovery(logManager, bufManager, dirtyPageRecordsTable)
 	if err != nil {
 		panic(err)
@@ -38,6 +39,7 @@ func Recovery(logManager *LogManager, bufManager *BufferManager) (nextUsefulTran
 	return
 }
 
+// 获取下一个可用的事务 ID
 func NextUsefulTransId(activeTransActionTable map[uint64]*TransactionTableEntry) uint64 {
 	nextUsefulTransactionId := uint64(0)
 	for txnId, _ := range activeTransActionTable {
@@ -133,16 +135,28 @@ func handleCheckPointLogDuringRecovery(checkPointEndLog *LogRecord, activeTransA
 	}
 }
 
-func analysisForRecovery(logManager *LogManager) (activeTransActionTable map[uint64]*TransactionTableEntry,
-	dirtyPageTables map[int32]*DirtyPageRecord) {
+func analysisForRecovery(logManager *LogManager) (
+	activeTransActionTable map[uint64]*TransactionTableEntry,
+	dirtyPageTables map[int32]*DirtyPageRecord,
+) {
+
 	activeTransActionTable = map[uint64]*TransactionTableEntry{}
 	dirtyPageTables = map[int32]*DirtyPageRecord{}
+
+	// 读取最后一个检查点
 	lsn := logManager.GetBeginCheckPointLSN()
+
+	// 读取该检查点之后的 LogRecord
 	logIte := logManager.LogIterator(lsn)
+
+	// 循环读取 LogRecord
 	for logIte.HasNext() {
+
+		// 取当前 LogRecord
 		log := logIte.Next()
 		recoveryLog.InfoF("analysis log: %s", log)
-		tp := log.TP
+
+		// ???
 		_, ok := activeTransActionTable[log.TransactionId]
 		if IsTransLog(log) && !ok {
 			activeTransActionTable[log.TransactionId] = &TransactionTableEntry{
@@ -152,6 +166,9 @@ func analysisForRecovery(logManager *LogManager) (activeTransActionTable map[uin
 				UndoNextLsn:   log.PrevLsn,
 			}
 		}
+
+		// 检查类型
+		tp := log.TP
 		switch tp {
 		case SetLogType:
 			activeTransActionTable[log.TransactionId].Lsn = log.LSN
@@ -185,6 +202,7 @@ func analysisForRecovery(logManager *LogManager) (activeTransActionTable map[uin
 		}
 		lsn += int64(log.Len())
 	}
+
 	// Note: in case packet is broken, we redirect the lsn and flushLsn here.
 	logManager.Lsn = lsn
 	logManager.FlushedLsn = lsn
@@ -193,10 +211,13 @@ func analysisForRecovery(logManager *LogManager) (activeTransActionTable map[uin
 			entry.State = TransactionC
 		}
 	}
+
 	return
 }
 
 func redoForRecovery(logManager *LogManager, bufManager *BufferManager, dirtyPageTable map[int32]*DirtyPageRecord) error {
+
+
 	recLsn := int64(-1)
 	for _, record := range dirtyPageTable {
 		if recLsn == -1 {
@@ -207,16 +228,21 @@ func redoForRecovery(logManager *LogManager, bufManager *BufferManager, dirtyPag
 			recLsn = record.RevLSN
 		}
 	}
+
+
 	logIte := logManager.LogIterator(recLsn)
 	for logIte.HasNext() {
 		log := logIte.Next()
+
 		if log.TP != SetLogType && log.TP != CompensationLogType {
 			continue
 		}
+
 		_, ok := dirtyPageTable[log.PageId]
 		if !ok || log.LSN < dirtyPageTable[log.PageId].RevLSN {
 			continue
 		}
+
 		page, err := bufManager.GetPage(log.PageId)
 		if err != nil {
 			return err
@@ -231,11 +257,13 @@ func redoForRecovery(logManager *LogManager, bufManager *BufferManager, dirtyPag
 				return err
 			}
 		}
+
 		if page.LSN < log.LSN {
 			redoLog(bufManager, log)
 			page.LSN = log.LSN
 			continue
 		}
+
 		dirtyPageTable[log.PageId].RevLSN = page.LSN
 	}
 	return nil
@@ -259,9 +287,10 @@ func redoLog(bufManager *BufferManager, log *LogRecord) error {
 
 func undoForRecovery(logManager *LogManager, bufManager *BufferManager, activeTransactionTable map[uint64]*TransactionTableEntry) error {
 	for {
-
-		//
+		// 获取当前事务关联的最大 LSN
 		maxUndoLsn := maximumUndoLsn(activeTransactionTable)
+
+		// 所有事务均已回滚完毕，退出
 		if maxUndoLsn == InvalidLsn {
 			return nil
 		}
@@ -271,7 +300,6 @@ func undoForRecovery(logManager *LogManager, bufManager *BufferManager, activeTr
 		if err != nil {
 			return err
 		}
-
 		// 不同 log 类型，做不同处理。
 		switch log.TP {
 		case TransAbortLogType, TransBeginLogType:
@@ -282,6 +310,7 @@ func undoForRecovery(logManager *LogManager, bufManager *BufferManager, activeTr
 			l := undoLog(log, bufManager, logManager, activeTransactionTable)
 			activeTransactionTable[log.TransactionId].Lsn = l.LSN
 			activeTransactionTable[log.TransactionId].UndoNextLsn = log.PrevLsn
+			//
 			if log.PrevLsn == InvalidLsn {
 				endLog := &LogRecord{
 					PrevLsn:       log.LSN,
@@ -297,6 +326,8 @@ func undoForRecovery(logManager *LogManager, bufManager *BufferManager, activeTr
 	return nil
 }
 
+
+//
 func maximumUndoLsn(activeTransactionTable map[uint64]*TransactionTableEntry) int64 {
 	maxLsn := int64(InvalidLsn)
 	for _, entry := range activeTransactionTable {
@@ -310,17 +341,25 @@ func maximumUndoLsn(activeTransactionTable map[uint64]*TransactionTableEntry) in
 	return maxLsn
 }
 
-func undoLog(undoLog *LogRecord, bufManager *BufferManager, logManager *LogManager,
-	activeTransactionTable map[uint64]*TransactionTableEntry) *LogRecord {
+func undoLog(
+	undoLog *LogRecord,
+	bufManager *BufferManager,
+	logManager *LogManager,
+	activeTransactionTable map[uint64]*TransactionTableEntry,
+) *LogRecord {
+
+	// 创建 LogRecord 的补偿 LogRecord
 	l := &LogRecord{
-		TP:            CompensationLogType,
-		TransactionId: undoLog.TransactionId,
-		PageId:        undoLog.PageId,
-		PrevLsn:       activeTransactionTable[undoLog.TransactionId].Lsn,
-		UndoNextLsn:   undoLog.PrevLsn,
+		TP:            CompensationLogType,		// 补偿
+		TransactionId: undoLog.TransactionId,	// 事务 ID
+		PageId:        undoLog.PageId,			// 页 ID
+		PrevLsn:       activeTransactionTable[undoLog.TransactionId].Lsn,	// 事务关联的最新的 WAL 日志序号
+		UndoNextLsn:   undoLog.PrevLsn,			//
 	}
+
 	recoveryLog.InfoF("undoLog: %s", undoLog)
 	var err error
+
 	switch undoLog.ActionTP {
 	case AddAction:
 		l.ActionTP = DelAction

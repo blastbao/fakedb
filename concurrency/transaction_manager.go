@@ -2,8 +2,8 @@ package concurrency
 
 import (
 	"errors"
-	"github.com/xiaobogaga/fakedb/buffer_logging"
-	"github.com/xiaobogaga/fakedb/util"
+	"github.com/blastbao/fakedb/buffer_logging"
+	"github.com/blastbao/fakedb/util"
 	"sync"
 )
 
@@ -43,7 +43,7 @@ type Transaction struct {
 	TransLockState TransLockState
 }
 
-type TransactionState byte
+type TransactionState byte	// 事务状态
 
 type WriteSet struct {
 	BeforeValue *buffer_logging.Pair
@@ -63,28 +63,41 @@ func (trans *TransactionManager) NewTransaction() *Transaction {
 		TransLockState: TransGrowing,
 		WriteSet:       map[int32]*WriteSet{},
 	}
+
+	// 保存到全局事务表
 	trans.Trans[ret.TransactionId] = ret
 	transManagerLog.InfoF("create new transaction, txnId: %d", ret.TransactionId)
+	// 更新全局事务 ID
 	trans.TransId++
 	return ret
 }
 
 var txnLog = util.GetLog("transaction")
 
+
+// 开启事务
 func (txn *Transaction) Begin() {
 	txnLog.InfoF("begin, txnId: %d", txn.TransactionId)
+
+	// 创建事务的 Begin Log
 	log := &buffer_logging.LogRecord{
-		PrevLsn:       txn.PrevLsn,
-		UndoNextLsn:   buffer_logging.InvalidLsn,
-		TransactionId: txn.TransactionId,
-		TP:            buffer_logging.TransBeginLogType,
+		PrevLsn:       txn.PrevLsn,							// 事务的 Begin Log 的 PrevLSN 为 -1
+		UndoNextLsn:   buffer_logging.InvalidLsn,			//
+		TransactionId: txn.TransactionId,					// 事务 ID
+		TP:            buffer_logging.TransBeginLogType,	// 日志类型
 	}
-	txn.Log.Append(log) // Begin Log
+
+	// 把事务的 Begin Log 写到 WAL 文件，得到该日志的 LSN 序号。
+	txn.Log.Append(log)
+	// 更新事务关联的 LSN
 	txn.PrevLsn = log.LSN
 }
 
+// 提交事务
 func (txn *Transaction) Commit() {
 	txnLog.InfoF("commit, txnId: %d", txn.TransactionId)
+
+	// 创建事务的 Commit Log
 	log := &buffer_logging.LogRecord{
 		PrevLsn:       txn.PrevLsn,
 		UndoNextLsn:   buffer_logging.InvalidLsn,
@@ -92,35 +105,52 @@ func (txn *Transaction) Commit() {
 		TP:            buffer_logging.TransCommitLogType,
 		Force:         true,
 	}
-	txn.Log.Append(log) // Begin Log
+
+	// 把事务的 Commit Log 写到 WAL 文件，得到该日志的 LSN 序号。
+	txn.Log.Append(log)
+	// 更新事务的 PrevLsn
 	txn.PrevLsn = log.LSN
+	// 更新事务状态为 "Commit"
 	txn.TransLockState = TransCommit
+	// 等待 Commit Log 刷盘
 	txn.Log.WaitFlush(log)
+	// 释放事务占有的锁
 	txn.ReleaseLocks()
 }
 
+// 回滚事务
 func (txn *Transaction) Rollback() error {
 	txnLog.InfoF("rollback, txnId: %d", txn.TransactionId)
+
+	// 创建事务的 RollBack Log
 	log := &buffer_logging.LogRecord{
 		PrevLsn:       txn.PrevLsn,
 		UndoNextLsn:   buffer_logging.InvalidLsn,
 		TransactionId: txn.TransactionId,
 		TP:            buffer_logging.TransAbortLogType,
 	}
-	txn.Log.Append(log) // Begin Log
+
+	// 把事务的 RollBack Log 写到 WAL 文件，得到该日志的 LSN 序号。
+	txn.Log.Append(log)
+	// 更新事务的 PrevLsn
 	txn.PrevLsn = log.LSN
-	err := txn.Undo(log.LSN)
-	if err != nil {
+	// 执行事务的回滚操作
+	if err := txn.Undo(log.LSN); err != nil {
 		return err
 	}
+	// 重置事务的写集合
 	txn.WriteSet = map[int32]*WriteSet{}
+	// 更新事务状态为 Abort
 	txn.TransLockState = TransAbort
+	// 释放事务占有的锁
 	txn.ReleaseLocks()
 	return nil
 }
 
 func (txn *Transaction) Undo(lsn int64) error {
+	// 遍历事务的更新日志
 	for pageId, writeSet := range txn.WriteSet {
+		// 用旧值覆盖新值，实验回滚
 		err := txn.Buf.Set(pageId, writeSet.BeforeValue.Key, writeSet.BeforeValue.Value, lsn)
 		if err != nil {
 			return err
@@ -138,21 +168,29 @@ func (txn *Transaction) ReleaseLocks() {
 
 var txnLockConflict = errors.New("cannot acquire lock, now transaction aborted")
 
-// Return whether found the key, the value of the key if found. error. Also return the index of the key: 0(not found), 1, 2
+// Return whether found the key, the value of the key if found.
+// error. Also return the index of the key: 0(not found), 1, 2
 func (txn *Transaction) Get(key []byte) (int32, bool, []byte, error) {
 	txnLog.InfoF("get, txnId: %d, key: %s", txn.TransactionId, string(key))
+
+	// 加共享锁
 	ok := txn.LockManager.LockShared(1, txn)
 	if !ok {
 		txn.Rollback()
 		return 0, false, nil, txnLockConflict
 	}
+
+	//
 	found, value, err := txn.Buf.Get(1, key)
 	if err != nil {
 		return 0, false, nil, err
 	}
+
+	//
 	if found {
 		return 1, true, value, nil
 	}
+
 	ok = txn.LockManager.LockShared(2, txn)
 	if !ok {
 		txn.Rollback()
@@ -162,9 +200,11 @@ func (txn *Transaction) Get(key []byte) (int32, bool, []byte, error) {
 	if err != nil {
 		return 0, false, nil, err
 	}
+
 	if found {
 		return 2, true, value, nil
 	}
+
 	return 0, false, nil, nil
 }
 
@@ -189,11 +229,13 @@ func (txn *Transaction) Set(key, value []byte) error {
 	if !found {
 		return txn.Add(key, value)
 	}
+
 	ok := txn.LockManager.LockUpgrade(id, txn)
 	if !ok {
 		txn.Rollback()
 		return txnLockConflict
 	}
+
 	// Todo:
 	// * support lock on txn.
 	// * support before and after value.

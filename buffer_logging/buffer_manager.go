@@ -6,7 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"github.com/xiaobogaga/fakedb/util"
+	"github.com/blastbao/fakedb/util"
 	"sync"
 	"time"
 )
@@ -125,7 +125,6 @@ func (buffer *BufferManager) Set(id int32, key, value []byte, lsn int64) error {
 		buffer.DirtyPageTable[id] = page
 		return nil
 	}
-
 
 	if page.RecvLsn == InvalidLsn {
 		page.RecvLsn = lsn
@@ -280,7 +279,12 @@ func (buffer *BufferManager) DirtyPageRecordTable() []*DirtyPageRecord {
 	// 遍历脏页列表
 	for id, page := range buffer.DirtyPageTable {
 		if page.Dirty {
-			ret = append(ret, &DirtyPageRecord{PageId: id, RevLSN: page.RecvLsn})
+			ret = append(ret,
+				&DirtyPageRecord{
+					PageId: id,				// 脏页 ID
+					RevLSN: page.RecvLsn,	//
+				},
+			)
 		}
 	}
 	return ret
@@ -291,6 +295,7 @@ func (buffer *BufferManager) FlushDirtyPage(logManager *LogManager) {
 
 	// 遍历脏页列表
 	for id, page := range buffer.DirtyPageTable {
+
 		//
 		if page.LSN <= logManager.GetFlushedLsn() {
 			bufManagerLog.InfoF("write dirty page: lsn: %d, key: %s, value: %s", page.LSN, string(page.Key), string(page.Value))

@@ -1,7 +1,7 @@
 package buffer_logging
 
 import (
-	"github.com/xiaobogaga/fakedb/util"
+	"github.com/blastbao/fakedb/util"
 	"io"
 	"os"
 	"sync"

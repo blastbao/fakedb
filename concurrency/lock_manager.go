@@ -1,7 +1,7 @@
 package concurrency
 
 import (
-	"github.com/xiaobogaga/fakedb/util"
+	"github.com/blastbao/fakedb/util"
 	"sync"
 )
 
