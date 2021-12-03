@@ -15,7 +15,9 @@ type LockManager struct {
 }
 
 func NewLockManager() *LockManager {
-	return &LockManager{LockMap: map[int32]*LockInfo{}}
+	return &LockManager{
+		LockMap: map[int32]*LockInfo{},
+	}
 }
 
 type LockMode byte
@@ -35,10 +37,12 @@ const (
 )
 
 func (locks *LockManager) LockShared(lockId int32, transaction *Transaction) bool {
+
 	if transaction.GetTransactionLockState() != TransGrowing {
 		transaction.SetTransactionLockState(TransAbort)
 		return false
 	}
+
 	locks.Latch.Lock()
 	lockInfo := locks.LockMap[lockId]
 	if lockInfo == nil {

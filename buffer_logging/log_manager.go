@@ -28,24 +28,30 @@ type LogManager struct {
 	FlushDuration          time.Duration
 }
 
+// ReadLastCheckPoint
+//
 // Read checkpoint. The checkPoint point to the lastest lsn of begin checkpoint.
 // The checkPoint file is written in WAL mode. and each checkPoint occupy 8 bytes.
 // To make sure data is complete, we will truncate those checkpoint whose length is less than 8 bytes.
 //
 // 读取检查点，即最后一次 Begin CheckPoint 对应的 LSN 。
-//
-// 注意，检查点文件大小一定是 8B 的整数倍，如果不是，那么可能是最后一次写入发生错误，那么应该忽略掉这部分残缺的数据。
-//
+// 注意，检查点文件大小一定是 8B 的整数倍，如果不是，那么可能是最后一次写入发生错误，
+// 那么应该忽略掉这部分残缺的数据。
 func ReadLastCheckPoint(reader *os.File) (int64, error) {
+
+	// 获取文件大小
 	stat, err := reader.Stat()
 	if err != nil {
 		return 0, err
 	}
 	size := stat.Size()
+
+	// 如果文件小于 8 字节，当作空文件
 	if size < 8 {
 		reader.Seek(0, io.SeekStart)
 		return 0, nil
 	}
+
 	// 如果 size 不是 8 的整数倍，就忽略掉尾部的错误字节。
 	checkPointAddr := size - size%8 - 8
 	_, err = reader.Seek(checkPointAddr, io.SeekStart)
@@ -102,6 +108,8 @@ func NewLogManager(ctx context.Context, bufferSize int, checkPointFileName strin
 
 const InvalidLsn int64 = -1
 
+// LogRecord 代表 wal 中的一条日志记录。
+//
 // Todo: maybe we need a crc here.
 type LogRecord struct {
 	LSN           int64         // 当前日志序号。
@@ -432,6 +440,8 @@ func IsTransLog(l *LogRecord) bool {
 }
 
 func (log *LogManager) Append(l *LogRecord) *LogRecord {
+
+	// 加锁，确保写 wal 是串行的
 	log.Lock.Lock()
 
 	// 设置 LSN
@@ -490,6 +500,17 @@ func (log *LogManager) CheckPoint(bufManager *BufferManager) {
 	}
 }
 
+
+// DoCheckPoint
+//
+// 创建检查点
+// 	1. 写入 "begin_checkpoint" 类型日志，得到该日志的 LSN
+//	2. 获取当前活跃事务列表，包含事务的 <TxID, 状态, LSN, UndoNextLsn> 信息
+//  3. 获取当前脏页列表，包含页面的 <PageId, RevLSN>
+//  4. 写入 "end_checkpoint" 类型日志，其包含活跃事务和脏页的信息
+//  5. 调用 flush 将日志落盘
+//  6. 将 "begin_checkpoint" 类型日志的 LSN 写入到独立的 CheckPoint 文件记录下来
+//
 func (log *LogManager) DoCheckPoint(bufManager *BufferManager) error {
 	// 创建 "begin_checkpoint" 日志
 	beginCheckPointRecord := &LogRecord{
@@ -576,7 +597,7 @@ func (log *LogManager) CloneTransactionTable() (ret []TransactionTableEntry) {
 			TransactionId: txnId,         // 事务 ID
 			State:         v.State,       // 事务状态
 			Lsn:           v.Lsn,         // 事务 LSN
-			UndoNextLsn:   v.UndoNextLsn, //
+			UndoNextLsn:   v.UndoNextLsn, // 事务 UndoLsn
 		})
 	}
 	return ret
@@ -609,7 +630,7 @@ func (log *LogManager) GetFlushedLsn() int64 {
 func (log *LogManager) AppendRecoveryLog(l *LogRecord) {
 	// 取当前 log.LSN
 	offset := log.Lsn
-	// 把当前 log.LSN 复制给 l
+	// 把当前 log.LSN 赋值给 l
 	l.LSN = log.Lsn
 	// 增加 log.LSN
 	log.Lsn += int64(l.Len())
@@ -620,10 +641,13 @@ func (log *LogManager) AppendRecoveryLog(l *LogRecord) {
 	}
 
 	l.Done = make(chan bool)
+
+	// 定位到 WAL 文件头
 	_, err := log.WAL.Seek(offset, io.SeekStart)
 	if err != nil {
 		panic(err)
 	}
+
 	// 将 l 写入 WAL 文件
 	data := l.Serialize()
 	for i := 0; i < l.Len(); {
@@ -633,6 +657,7 @@ func (log *LogManager) AppendRecoveryLog(l *LogRecord) {
 		}
 		i += size
 	}
+
 }
 
 func (log *LogManager) updateActiveTransactionTable(l *LogRecord) {
@@ -679,13 +704,15 @@ func (log *LogManager) ReadLog(offset int64) (*LogRecord, error) {
 	return l, nil
 }
 
+
+// LogIterator WAL 日志迭代器
 type LogIterator struct {
 	LSN     int64		// 日志偏移量
 	WAL     *os.File	// 日志文件
 	NextLog *LogRecord	// 当前日志记录
 }
 
-// 从 wal 文件的 offset 处读取一个 LogRecord 。
+// ReadLog 从 wal 文件的 offset 处读取一个 LogRecord 。
 func ReadLog(wal *os.File, offset int64) (*LogRecord, error) {
 
 	// 定位到 Start 偏移处
@@ -755,33 +782,47 @@ type Pair struct {
 	Value []byte
 }
 
-// Serialize: len(key) + key + len(value) + value
+// Serialize
+// pair = len(key) + key + len(value) + value
 func (pair *Pair) Serialize() []byte {
 	data := make([]byte, pair.Len())
+	// len(key)
 	binary.BigEndian.PutUint32(data, uint32(len(pair.Key)))
+	// key
 	copy(data[4:], pair.Key)
+	// len(value)
 	binary.BigEndian.PutUint32(data[4+len(pair.Key):], uint32(len(pair.Value)))
+	// value
 	copy(data[8+len(pair.Key):], pair.Value)
 	return data
 }
 
+// Deserialize
 func (pair *Pair) Deserialize(data []byte) error {
+	// check
 	if len(data) < 8 {
 		return damagedPacket
 	}
+	// len(key)
 	keyLen := binary.BigEndian.Uint32(data)
 	if uint32(len(data)) < keyLen+8 {
 		return damagedPacket
 	}
+	// key
 	pair.Key = data[4 : 4+keyLen]
+	// len(value)
 	valueLen := binary.BigEndian.Uint32(data[4+keyLen:])
 	if uint32(len(data)) < keyLen+valueLen+8 {
 		return damagedPacket
 	}
+	// value
 	pair.Value = data[8+keyLen : 8+keyLen+valueLen]
 	return nil
 }
 
+// Len
+//
+// pair = len(key) + key + len(value) + value
 func (pair *Pair) Len() int {
 	return 8 + len(pair.Key) + len(pair.Value)
 }

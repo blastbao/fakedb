@@ -230,6 +230,8 @@ func (txn *Transaction) Set(key, value []byte) error {
 		return txn.Add(key, value)
 	}
 
+
+	//
 	ok := txn.LockManager.LockUpgrade(id, txn)
 	if !ok {
 		txn.Rollback()
@@ -239,6 +241,8 @@ func (txn *Transaction) Set(key, value []byte) error {
 	// Todo:
 	// * support lock on txn.
 	// * support before and after value.
+	//
+	//
 	beforeValue := &buffer_logging.Pair{Key: key, Value: v}
 	afterValue := &buffer_logging.Pair{Key: key, Value: value}
 	log := &buffer_logging.LogRecord{

@@ -282,7 +282,7 @@ func (buffer *BufferManager) DirtyPageRecordTable() []*DirtyPageRecord {
 			ret = append(ret,
 				&DirtyPageRecord{
 					PageId: id,				// 脏页 ID
-					RevLSN: page.RecvLsn,	//
+					RevLSN: page.RecvLsn,	// 脏页 RevLSN
 				},
 			)
 		}
